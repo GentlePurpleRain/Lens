@@ -65,8 +65,6 @@ SCHROEDINGER_TIMEOUT = 90 # The time before the bot reminds a user to indicate w
 GUESS_TIMEOUT = 30 # The time before the bot reminds a clue setter to confirm/deny a guess that has been made.
 WAVE_DEATH = 1800 # The number of seconds before a wave is considered "expired"
 WAVES_FOR_PING = 3 # The number of waves o/ required to trigger an auto-ping
-WHITELIST = set([200996, 209507, 69330, 56166, 251910, 17335, 240387, 21351, 188759, 254945, 152262, 207333, 215298, 147578, 217429, 147578, 167070]) # Users who are allowed to command the bot
-PINGLIST = set(['GentlePurpleRain']) # Users who want to be notified when a new game is starting.
 MAX_CLUES = 10
 DEFAULT_MUTE_LENGTH = 600
 CONTACT_THRESHOLD = 5
@@ -77,11 +75,20 @@ my_user = None # This bot's user ID
 shutdown = False # Indicates whether the bot has been shut down
 clues = {} # Holds all the active clues, indexed by clue number
 dead_clues = [] # Holds all dead/solved clues.
+whitelist = set()  # Users who are allowed to command the bot
+pinglist = set() # Users who want to be notified when a new game is starting.
 
 game_state = Game_state.None
 users = {}
 num_contact_guesses = 0 # How many guesses have been made after a pass (by those who contacted the clue)
 verbose = True # When true, the bot talks more.
+
+# Unique IDs for the database tables
+game_id = -1
+clue_id = -1
+guess_id = -1
+contact_id = -1
+defence_id = -1
 
 # Defender info
 defender_id = -1 # Chat ID
@@ -111,11 +118,11 @@ lives_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:lives|(?:is )?(?:still)?alive|(
 wave_pattern = re.compile(r"\s*(\\(?:o|O|0)|(?:o|O|0)/|<code>(\\0|0/)</code>)\s*", re.IGNORECASE)
 
 def main():
-    global room, my_user, client
+    global room, my_user, client, whitelist, pinglist
 
     # Check if a whitelist/pinglist` exists in the DB.  If no, initialize it in the DB; if yes, load it from the DB.
-    init_list(WHITELIST, "whitelist")
-    init_list(PINGLIST, "pinglist")
+    whitelist = init_list(whitelist, "whitelist")
+    pinglist = init_list(pinglist, "pinglist")
 
     # Set ChatExchange variables
     host_id = 'stackexchange.com'
@@ -160,7 +167,7 @@ def on_message(message, client):
         # Access levels for different commands
         is_bot = (message.user.id == my_user.id)
         is_super_user = (is_bot or message.user.is_moderator)
-        is_trusted_user = (is_super_user or message.user.id in WHITELIST)
+        is_trusted_user = (is_super_user or message.user.id in whitelist)
 
         try:
             # Remove all weird HTML encodings (like &amp; for &)
@@ -293,12 +300,12 @@ def on_message(message, client):
             # Add/remove or list users on the whitelist
             elif is_super_user and input.lower().startswith("!whitelist"):
                 if TESTING: print("Matched !whitelist command")
-                modify_list(WHITELIST, input[11:], "whitelist")
+                modify_list(whitelist, input[11:], "whitelist")
 
             # Add/remove or list users on the pinglist
             elif is_trusted_user and input.lower().startswith("!pinglist"):
                 if TESTING: print("Matched !pinglist command")
-                modify_list(PINGLIST, input[10:], "pinglist")
+                modify_list(pinglist, input[10:], "pinglist")
     
             # Output a list of commands, and a brief introduction to the bot
             elif input.lower().strip() == "!help":
@@ -808,20 +815,20 @@ def check_waves():
 
 # Print a help message
 def info():
-    send_message("""Hello! I'm %s, a bot to help with the game of Contact. 
-I will try to keep track of the game state and keep the game moving. If you're on my whitelist, you can use the following commands to communicate with me (some are mod-only): 
-    !clues                     - list all active clues
-    !contacts [clueNum]        - list contacts for a specific clue or all clues
-    !unpass                    - undo a "pass" if you made a mistake
-    !kill                      - remove a clue from the list of active clues. This will kill anyone's clue, not just your own.
-    !uncontact clueNum         - remove all contacts for clue "clueNum"
-    !shutup [minutes]          - silence me completely for the specified amount of time (defaults to 10 min)
-    !speak                     - undo a !shutup command
-    !verbose [on|off]          - in verbose mode, I'll comment more on game events. No parameter lists the current state
-    !whitelist [[+|-]userNum]  - add/remove a user from the whitelist, or list users on the whitelist
-    !pinglist [[+|-]userName]  - add/remove a user from the pinglist, or list users on the pinglist
-    !ping                      - ping all users on the pinglist to indicate that you want to start a game
-    !shutdown                  - shut me down permanently. I will need to be restarted by the bot owner""" % (my_user.name))
+    send_message("""    Hello! I'm %s, a bot to help with the game of Contact. 
+    I will try to keep track of the game state and keep the game moving. If you're on my whitelist, you can use the following commands to communicate with me (some are mod-only): 
+     !clues                    - list all active clues
+     !contacts [clueNum]       - list contacts for a specific clue or all clues
+     !unpass                   - undo a "pass" if you made a mistake
+     !kill                     - remove a clue from the list of active clues. This will kill anyone's clue, not just your own.
+     !uncontact clueNum        - remove all contacts for clue "clueNum"
+     !shutup [minutes]         - silence me completely for the specified amount of time (defaults to 10 min)
+     !speak                    - undo a !shutup command
+     !verbose [on|off]         - in verbose mode, I'll comment more on game events. No parameter lists the current state
+     !whitelist [[+|-]userNum] - add/remove a user from the whitelist, or list users on the whitelist
+     !pinglist [[+|-]userName] - add/remove a user from the pinglist, or list users on the pinglist
+     !ping                     - ping all users on the pinglist to indicate that you want to start a game
+     !shutdown                 - shut me down permanently. I will need to be restarted by the bot owner""" % (my_user.name), False)
 
 def modify_list(list_var, param, table_name):
     if param != "":
@@ -885,8 +892,8 @@ def add_star(msg):
 
 @cooldown(10)
 def ping():
-    for x in range(0, len(PINGLIST), 10):
-        send_message( " ".join('@'+name for name in PINGLIST[x:x+10]) )
+    for x in range(0, len(pinglist), 10):
+        send_message( " ".join('@'+name for name in pinglist[x:x+10]) )
 
 @cooldown(10)
 def show_list(list_var):
@@ -898,7 +905,7 @@ def show_list(list_var):
     send_message(list, False) #Allow more than 500 chars
     if len(list) > 500:
         send_message("That list is getting kind of long.  You might want to consider pruning those who are no longer active...")
-
+        
 def init_list(list_var, table_name):
     db = sqlite3.connect('temp.db')
     
@@ -917,5 +924,6 @@ def init_list(list_var, table_name):
         log('debug', "%s: %s" % (table_name, list_var))
 
     db.close()
+    return list_var
     
 main()
