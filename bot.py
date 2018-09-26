@@ -65,9 +65,10 @@ SCHROEDINGER_TIMEOUT = 90 # The time before the bot reminds a user to indicate w
 GUESS_TIMEOUT = 30 # The time before the bot reminds a clue setter to confirm/deny a guess that has been made.
 WAVE_DEATH = 1800 # The number of seconds before a wave is considered "expired"
 WAVES_FOR_PING = 3 # The number of waves o/ required to trigger an auto-ping
-MAX_CLUES = 10
-DEFAULT_MUTE_LENGTH = 600
-CONTACT_THRESHOLD = 5
+MAX_CLUES = 10 # If this many clues are active, the bot will suggest not posting more clues, and may suggest a pass or more contacts, based on the number of current contacts.
+DEFAULT_MUTE_LENGTH = 600 # The number of seconds the bot will stay silent when muted, if a time isn't explicitly provided.
+CONTACT_THRESHOLD = 5 # The minimum number of contacts required before the bot suggests that the defender pass (only if clues are above MAX_CLUES)
+MESSAGE_DUPE_DELAY = 10 # The time period within which we cannot post two identical messages.
 
 client = None # The ChatExchange client reference
 room = None # The ChatExchange room reference
@@ -77,17 +78,17 @@ clues = {} # Holds all the active clues, indexed by clue number
 dead_clues = [] # Holds all dead/solved clues.
 whitelist = set()  # Users who are allowed to command the bot
 pinglist = set() # Users who want to be notified when a new game is starting.
+recent_messages = {} # Keep track of the last few messages sent, so we don't repeat ourselves unnecessarily.
+last_clue_solved = None # The last clue solved is going to be the one that wins the game.  We need that info at game end.
+last_clue_guessed = None # If we don't have a "last clue solved", we'll go with the last one guessed instead.
+pass_with_no_contact = False # If someone passes before a clue is contacted, it means they think someone has it.  We have different rules in that situation.
 
 game_state = Game_state.None
-users = {}
 num_contact_guesses = 0 # How many guesses have been made after a pass (by those who contacted the clue)
 verbose = True # When true, the bot talks more.
 
 # Unique IDs for the database tables
 game_id = -1
-clue_id = -1
-guess_id = -1
-contact_id = -1
 defence_id = -1
 
 # Defender info
@@ -104,17 +105,22 @@ waves = {} # Timestamps of the most recent waves ( o/ ) posted in the room.
 
 # Regular expression match patterns for the various game-related inputs:
 clue_number = "\d+(?:\.\d+)?'*"
+punct = "[:;).,]"
 
 clue_pattern = re.compile(r"\s*(%s(?:,\s*%s)*)[:).]?\s*<b>(.*)</b>.*" % (clue_number, clue_number), re.IGNORECASE)
 defender_pattern = re.compile(r"\s*.*defending:?\s*<b>([A-Z ]+)</b>\s*$", re.IGNORECASE)
 guess_pattern = re.compile(r"\s*(%s)[:).]?(?: is| it's(?: not)?)?\s*([^?]+)" % (clue_number), re.IGNORECASE)
-yes_pattern = re.compile(ur"\s*(%s)[:).]?\s*((?:y|ok|yes|yep|(?:(?:(?:.+ )is )?(?:c|<b>c</b>)orrect|right)|\u2713+|\u2714+)(?:\s+.*)?)" % (clue_number), re.IGNORECASE)
-no_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:n|no|nope|x|(?:(?:.+ )is )?wrong|(?:(?:.+ )is )?(?:(?:inc|<b>inc</b>|<b>in</b>c|)orrect|(?:not|<b>not</b>) (?:correct|right))(?:\s+.*)?))" % (clue_number), re.IGNORECASE)
+yes_pattern = re.compile(ur"\s*(%s)[:).]?\s*((?:y|ok|yes|yep|(?:(?:.+ )?(?:is )?(?:c|<b>c</b>)orrect|right)|(?:is .+)|\u2713+|\u2714+)(?:[\s:;.,]+.*)?)" % (clue_number), re.IGNORECASE)
+no_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:n|no|nope|x|(?:(?:.+ )?is )?wrong|(?:(?:.+ )is )?(?:(?:inc|<b>inc</b>|<b>in</b>c|)orrect|(?:not|<b>not</b>) (?:correct|right))(?:[\s:;.,]+.*)?))" % (clue_number), re.IGNORECASE)
 contact_pattern = re.compile(r"\s*(?:contact|c)\s*(%s(?:,\s*%s)*)" % (clue_number, clue_number), re.IGNORECASE)
 uncontact_pattern = re.compile(r"\s*(?:uncontact|u|uc)\s*(%s(?:,\s*%s)*)" % (clue_number, clue_number), re.IGNORECASE)
 pass_pattern = re.compile(r"\s*(?:I )?(?:am )?pass(?:ing)?(?: on)?\s*(%s)" % (clue_number), re.IGNORECASE)
-dies_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:dies|(?:(?:is )?dead|done)|was)(?:[\s:;.]+.*)?)" % (clue_number), re.IGNORECASE)
-lives_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:lives|(?:is )?(?:still)?alive|(?:stays|remains)(?: alive)?|continues|survives)(?:[\s:;.]+.*)?)" % (clue_number), re.IGNORECASE)
+dies_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:dies|(?:(?:is )?dead|done))(?:[\s:;.,]+.*)?)" % (clue_number), re.IGNORECASE)
+lives_pattern = re.compile(r"\s*(%s)[:).]?\s*((?:lives|(?:is )?(?:still)?alive|(?:stays|remains)(?: alive)?|continues|survives)(?:[\s:;.,]+.*)?)" % (clue_number), re.IGNORECASE)
+end_pattern = re.compile(r"\s*.*(?:defended|was defending|my word (?:was|is))[\s:;.,]*(?:<[bi]>)?([A-Z]+)(?:</[bi]>)?\s*$", re.IGNORECASE)
+end_pattern_2 = re.compile(r"\s*(?:<[bi]>)?\"?([A-Z]+)\"?(?:</[bi]>)?\s+(?:was|is) my word.*\s*$", re.IGNORECASE)
+end_pattern_3 = re.compile(r"\s*(?:DH|direct hit)[\s:;.,!]*(?:<[bi]>)?([A-Z]+)?(?:</[bi]>)?\s*$", re.IGNORECASE)
+end_pattern_4 = re.compile(ur"\s*(?:<[bi]>)?([A-Z]+)(?:</[bi]>)?[\s:;.,]*(?:\u2713+|\u2714+)\s*$", re.IGNORECASE) # Doesn't seem to work.
 wave_pattern = re.compile(r"\s*(\\(?:o|O|0)|(?:o|O|0)/|<code>(\\0|0/)</code>)\s*", re.IGNORECASE)
 
 def main():
@@ -123,6 +129,10 @@ def main():
     # Check if a whitelist/pinglist` exists in the DB.  If no, initialize it in the DB; if yes, load it from the DB.
     whitelist = init_list(whitelist, "whitelist")
     pinglist = init_list(pinglist, "pinglist")
+    
+    # Initialize the database that stores all game data/statistics
+    # If it doesn't exist, create it.
+    init_db()
 
     # Set ChatExchange variables
     host_id = 'stackexchange.com'
@@ -152,22 +162,33 @@ def main():
 
     log('info', "(You are now in room #%s on %s.)" % (room_id, host_id))
 
-    # Continue to loop, reading each message posted to the room
+    # Don't exit until the shutdown variable is set. All the real stuff happens in on_message().
     while not shutdown:
-        message = raw_input("<< ")
-        
-    # Log out of ChatExchange
-    client.logout()
+        time.sleep(2)
 
 # Do this each time a message is posted/edited
 def on_message(message, client):
-    if isinstance(message, chatexchange.events.MessagePosted) \
-            or isinstance(message, chatexchange.events.MessageEdited):
+    global whitelist, pinglist, shutdown
+    is_edit = isinstance(message, chatexchange.events.MessageEdited)
+
+    # If the message containing a clue is deleted, remove the clue from the list of active clues.
+    if isinstance(message, chatexchange.events.MessageDeleted):
+        try:
+            deleted_clue = None
+            for c in clues.itervalues():
+                if c.message == message.message:
+                    deleted_clue = c
+            if deleted_clue is not None:
+                remove_clue(deleted_clue, Clue_state.Dead)
+        except:
+            log_exception(*sys.exc_info())
+    
+    if isinstance(message, chatexchange.events.MessagePosted) or is_edit:
 
         # Access levels for different commands
         is_bot = (message.user.id == my_user.id)
         is_super_user = (is_bot or message.user.is_moderator)
-        is_trusted_user = (is_super_user or message.user.id in whitelist)
+        is_trusted_user = (is_super_user or message.user in room.owners or str(message.user.id) in whitelist)
 
         try:
             # Remove all weird HTML encodings (like &amp; for &)
@@ -175,19 +196,26 @@ def on_message(message, client):
             
             # This will fail if there are any unicode characters in the input. Mostly a problem with check mark.
             # Not a concern when TESTING is False.
-            if TESTING: print(">> (%s / %s) %s" % (message.user.name, repr(message.user.id), input))
+            # print(">> (%s / %s) %s" % (message.user.name, repr(message.user.id), input))
 
             # Match the input using all the patterns defined above, to determine what type of input it is
             clue_match = re.match(clue_pattern, input)
             defender_match = re.match(defender_pattern, input)
-            guess_match = re.match(guess_pattern, input)
             yes_match = re.match(yes_pattern, input)
+            guess_match = re.match(guess_pattern, input)
             no_match = re.match(no_pattern, input)
             contact_match = re.match(contact_pattern, input)
             uncontact_match = re.match(uncontact_pattern, input)
             pass_match = re.match(pass_pattern, input)
             dies_match = re.match(dies_pattern, input)
             lives_match = re.match(lives_pattern, input)
+            end_match = re.match(end_pattern, input)
+            end_match_2 = re.match(end_pattern_2, input)
+            end_match_3 = re.match(end_pattern_3, input)
+            end_match_4 = re.match(end_pattern_4, input)
+            
+            ### NOTE: ###
+            # The order of the if/elif statements below is important.  Some input matches more than one pattern, so it's important that we match certain ones before others.
             
             # Negation of guess
             if not is_bot and no_match is not None:
@@ -210,14 +238,29 @@ def on_message(message, client):
                 confirm_life(lives_match.groups()[0].strip(), lives_match.groups()[1].strip(), message.user)
             
             # Clue
-            elif not is_bot and clue_match is not None:
+            elif clue_match is not None:
                 numbers = [number.strip() for number in clue_match.groups()[0].split(',')]
                 for number in numbers:
                     if TESTING: print("Matched clue %s: %s" % (number, clue_match.groups()[1]))
-                    add_clue(message, number, clue_match.groups()[1].strip())
+                    add_clue(message, number, clue_match.groups()[1].strip(), is_edit)
                 
+            # Game over
+            elif message.user.id == defender_id and end_match is not None:
+                if TESTING: print("Matched end of game (1)")
+                end_game(end_match.groups()[0].strip())
+            elif message.user.id == defender_id and end_match_2 is not None:
+                if TESTING: print("Matched end of game (2)")
+                end_game(end_match_2.groups()[0].strip())
+            elif message.user.id == defender_id and end_match_3 is not None:
+                if TESTING: print("Matched end of game (3)")
+                word = last_clue_solved.guess if last_clue_solved is not None else last_clue_guessed.guess
+                end_game(word)
+            elif message.user.id == defender_id and end_match_4 is not None:
+                if TESTING: print("Matched end of game (4)")
+                end_game(end_match_4.groups()[0].strip())
+                    
             # "Defending" message
-            elif not is_bot and defender_match is not None:
+            elif defender_match is not None:
                 if TESTING: print("Matched defender: %s, defending %s" % (message.user.name, defender_match.groups()[0].strip()))
                 repin_defender(message, defender_match.groups()[0].strip())
                 
@@ -240,7 +283,7 @@ def on_message(message, client):
             elif not is_bot and pass_match is not None:
                 if TESTING: print("Matched pass for #%s" % (pass_match.groups()[0].strip()))
                 pass_clue(message, pass_match.groups()[0].strip())
-                    
+                
             ### Bot commands ###
             
             # Reset (unstar/unpin) all current game messages, and reset game variables
@@ -278,6 +321,11 @@ def on_message(message, client):
                 if TESTING: print("Matched !verbose command")
                 toggle_verbosity(input[9:])
 
+            # Resume a game that was interrupted, or where the bot went down partway through.
+            elif is_trusted_user and input.lower().startswith("!resume"):
+                if TESTING: print("Matched !resume command")
+                load_game(input[8:])
+
             # If the bot recognized a pass in error, reverse the pass.
             elif is_trusted_user and input.lower().strip() == "!unpass":
                 reverse_pass()
@@ -291,6 +339,10 @@ def on_message(message, client):
                 tokens = input.split(" ")
                 if len(tokens) != 2: send_message("Syntax: **`!uncontact <clueNum>`**")
                 remove_contact(message, [tokens[1]], True) # remove all contacts for this clue
+            
+            # Tell the bot that the game is over
+            elif is_trusted_user and input.lower().strip() == "!gameover":
+                end_game()
             
             # Notify everyone in the pinglist of a game/potential game
             elif is_super_user and input.lower().strip() == "!ping":
@@ -312,10 +364,17 @@ def on_message(message, client):
                 if TESTING: print("Matched !help command")
                 info()
                 
+            # Output game statistics
+            elif is_trusted_user and input.lower().startswith("!stats"):
+                if TESTING: print("Matched !stats command")
+                game_stats(input[7:])
+                
             # Shut down the bot remotely
             elif is_super_user and input.lower().strip() == "!shutdown":
                 print("Matched !shutdown command")
                 shutdown = True
+                client.logout()
+                sys.exit()
                 
             # Count the number of people waving in the room.  If enough, ping others to join.
             elif re.match(wave_pattern, input) is not None:
@@ -325,28 +384,37 @@ def on_message(message, client):
             # Check for invalid command/insufficient permissions.
             elif input[0] == "!" :
                 if not is_trusted_user:
-                    if verbose: send_message("I'm sorry, I've been told not to listen to you. Try asking a mod to add you to the whitelist.")
+                    send_message("I'm sorry, I've been told not to listen to you. Try asking a mod to add you to the whitelist.")
                 else:
-                    if verbose: send_message("I don't recognize that command, or you don't have sufficient permission.  Type `!help` for a list of valid commands.")
+                    send_message("I don't recognize that command, or you don't have sufficient permission.  Type `!help` for a list of valid commands.")
+
+            ### Check various statuses ###
+            
+            # If clues haven't been confirmed as alive/dead after a certain time has elapsed since the last new letter, let the clue setter know.
+            if verbose: check_clue_status()
+            
+            # If someone hasn't confirmed/denied a guess after a certain time has elapsed, let them know.
+            if verbose: check_guess_status()
+            
+            # Check if a sufficient number of people have waved in the last while, to warrant pinging other users.
+            check_waves()
 
         except:
             log_exception(*sys.exc_info())
-            #traceback.print_exc()
-            #print ""
-        
-        # If clues haven't been confirmed as alive/dead after a certain time has elapsed since the last new letter, let the clue setter know.
-        if verbose: check_clue_status()
-        
-        # If someone hasn't confirmed/denied a guess after a certain time has elapsed, let them know.
-        if verbose: check_guess_status()
-        
-        # Check if a sufficient number of people have waved in the last while, to warrant pinging other users.
-        check_waves()
 
 # Someone has posted a new clue.
-def add_clue(msg, number, text):
-    global clues, clue_id
-    if game_state == Game_state.Passed:
+def add_clue(msg, number, text, is_edit):
+    global clues
+
+    if is_edit and number in clues:
+        clues[number].clue_text = text
+        db = sqlite3.connect('Contact.db')
+        db.execute('UPDATE clue SET Text = ? WHERE Id = ?', (text, clues[number].db_id))
+        db.commit()
+        db.close()
+        return
+
+    elif game_state == Game_state.Passed:
         send_message("%s has passed on clue #%s. Please don't post any new clues until the pass has been resolved. I recommend deleting this clue, and reposting after the pass is resolved. (I am ignoring it.)" % (defender_name, number))
     elif game_state == Game_state.WaitingForLetter:
         send_message("We are waiting on %s to provide a new letter. Please don't post any new clues until they have done so. I recommend deleting this clue (I am ignoring it)" % (defender_name))
@@ -356,7 +424,14 @@ def add_clue(msg, number, text):
         if msg.user.id == defender_id and not TESTING:
             send_message("You are the defender -- you can't post clues!")
         elif number in clues:
-            send_message("There is already an active clue #%s.  Please edit or repost with a different number." % (number))
+            if msg.user.id == my_user.id: #The bot posted this as part of resuming a game
+                clues[number].message = msg.message
+                #Hack to star our own message:  Pin, then unpin
+                toggle_pinning(msg.message)
+                time.sleep(1.1)
+                toggle_pinning(msg.message)
+            else:
+                send_message("There is already an active clue #%s.  Please edit or repost with a different number." % (number))
         else: # Initialize a new clue instance
             c = clue()
             c.number = number
@@ -371,19 +446,27 @@ def add_clue(msg, number, text):
             if msg.message.stars == 0: # Sometimes a single message contains several clues (e.g. 4,5: Fifth space on a Monopoly board = READING RAILROAD). Only attempt to star if it hasn't already been starred.
                 msg.message.star()
             
-            # If there are too many active clues, give an appropriate message.
             if len(clues) >= MAX_CLUES:
+                # If there are too many active clues, give an appropriate message.
                 if verbose: send_message("There are now %s unsolved clues.  Please don't post any more clues until some have been resolved." % (len(clues)))
                 total_contacts = 0
                 # Count the total number of contacts on all clues
                 for cl in clues.itervalues():
                     total_contacts += len(cl.contacts)
-                # If there are a lot of contacts, suggest that the defender pass
                 if total_contacts >= CONTACT_THRESHOLD:
+                    # If there are a lot of contacts, suggest that the defender pass
                     if verbose: send_message("%s, there are a total of %s contacts on existing clues.  You might want to think about passing if you can't solve any of them. (Use `!contacts` to see current contacts.)" % (defender_name, total_contacts))
-                # Otherwise, suggest that people focus on solving clues
                 else:
+                    # Otherwise, suggest that people focus on solving clues
                     if verbose: send_message("There aren't very many contacts on existing clues.  Why don't you focus on solving some of them instead of posting more?")
+
+            db = sqlite3.connect('Contact.db')
+            cursor = db.cursor()
+            cursor.execute('INSERT INTO clue (ClueNumber, SetterId, SetterName, Text, GameId, DefenceId, ChatId, PostTimeUTC) values (?, ?, ?, ?, ?, ?, ?, ?)', 
+                            (number, msg.user.id, msg.user.name, text, game_id, defence_id, msg.message.id, datetime.utcnow()))
+            c.db_id = cursor.lastrowid
+            db.commit()
+            db.close()
 
     else: # Should never happen
         print("Add clue in None state")
@@ -391,45 +474,52 @@ def add_clue(msg, number, text):
         
 # Someone has posted a new guess.  Generally anything that starts with a number and doesn't match something else (confirmation/denial, death/life, etc.) is considered a guess.
 def add_guess(number, guess, guesser):
-    guess = guess.upper()
-    global clues, num_contact_guesses
+    global clues, num_contact_guesses, last_clue_guessed, last_clue_solved
 
-    # Can't make another guess if there is a guess outstanding.
-    if clues[number].guess != "":
-        send_message("We are currently waiting on %s to confirm or deny %s's guess for clue #%s.  Please wait until that has been done before making another guess." % (clues[number].setter_name, clues[number].guesser_name, number))
+    guess = guess.upper()
+
+    # Can't make another guess if there is a guess outstanding (except after a pass). 
+    if number in clues and clues[number].guess != "" and game_state != Game_state.Passed:
+        send_message("We are currently waiting on %s to confirm %s's guess for clue #%s.  Please wait until that has been done before making another guess." % (clues[number].setter_name, clues[number].guesser_name, number))
+        return
 
     # Regular game progress
-    elif game_state == Game_state.Guessing:
+    if game_state == Game_state.Guessing:
         # Defender posted the guess, and game state is Guessing
         if guesser.id == defender_id or TESTING:
-            add_defender_guess(clues[number], guess, guesser)
+            add_defender_guess(number, guess, guesser)
         # Someone else posted the guess when they shouldn't be guessing.
         else:
-            if number in clues:
+            if guess[:3] == "WAS": # Swallow messages like "3 was ANIMAL".  They're just after-the-fact discussion about a clue
+                pass
+            elif number in clues:
                 if verbose: send_message("You can't make guesses right now; that's the defender's job.  Wait till a clue has been passed.")
             else:
                 if verbose: send_message("Clue text must be **bold** (surround it with `**` or `__`).  Please try again.")
+
     # Defender has passed.  
     elif game_state == Game_state.Passed:
         # Still allow guesses by the defender on other clues, even while pass is pending.
         if guesser.id == defender_id and not TESTING:
             if number not in clues:
-                if verbose: send_message("There doesn't appear to be an active clue with the number %s, so you can't make a guess." % (number))
+                send_message("There doesn't appear to be an active clue with the number %s, so you can't make a guess." % (number))
             elif clues[number].state == Clue_state.Set:
-                add_defender_guess(clues[number], guess, guesser)
+                add_defender_guess(number, guess, guesser)
             else:
-                if verbose: send_message("You passed on clue #%s.  Please refrain from making guesses until the pass is resolved." % (number))
+                send_message("You passed on clue #%s.  Please refrain from making guesses until the pass is resolved." % (number))
         # Someone tries to post a guess for another clue
         elif number not in clues or clues[number].state != Clue_state.Passed:
             send_message("%s has passed on clue #%s. We are currently only accepting guesses for that clue from those who have contacted it." % (defender_name, number))
-        # The guesser is someone who contacted this clue
-        elif guesser.id in clues[number].contacts.keys():
+        # The guesser is someone who contacted this clue (or no one contacted this clue)
+        elif guesser.id in clues[number].contacts.keys() or pass_with_no_contact:
             clues[number].set_guess(guess, guesser.name)
             num_contact_guesses += 1
+            last_clue_guessed = clues[number]
+            last_clue_solved = None
             if TESTING: print("Guess for clue #%s:\n%s" % (number, guess))
         # The guesser didn't contact this clue
         else:
-            if verbose: send_message("You haven't contacted clue #%s.  Only those who have contacted the clue may guess.  (To see who has contacted it, use **`!contacts %s`**)" % (number, number))
+            send_message("You haven't contacted clue #%s.  Only those who have contacted the clue may guess.  (To see who has contacted it, use **`!contacts %s`**)" % (number, number))
     elif game_state == Game_state.WaitingForLetter:
         send_message("We are currently waiting for %s to provide an additional letter.  No guesses (or clues) are being accepted right now." % (defender_name))
     elif game_state == Game_state.Finished:
@@ -438,67 +528,71 @@ def add_guess(number, guess, guesser):
         print("Guess in None state")
 
 # Helper function to process a valid guess by the defender.
-def add_defender_guess(clue, guess, guesser):
-    start_of_guess = guess.strip()[:len(defending_text)] # Grab the first X letters of the guess, where X is the length of the currently defended text
-    # Trying to guess for a non-existent clue
-    if clue.number not in clues:
-        if verbose: send_message("There doesn't appear to be an active clue with the number %s, so you can't make a guess." % (clue.number))
-    # Guess doesn't start with the right letters
+def add_defender_guess(number, guess, guesser):
+    start_of_guess = guess.strip().replace(" ","")[:len(defending_text)] # Grab the first X letters of the guess (minus spaces), where X is the length of the currently defended text
+    if number not in clues:
+        # Trying to guess for a non-existent clue
+        if verbose: send_message("There doesn't appear to be an active clue with the number %s, so you can't make a guess." % (number))
     elif start_of_guess != defending_text:
+        # Guess doesn't start with the right letters
         send_message("The word being defended starts with **%s**.  Your guess starts with **%s**.  Try again." % (defending_text, start_of_guess))
-    # Valid guess
     else:
-        clue.set_guess(guess, guesser.name)
-        if TESTING: print("Guess for clue #%s:\n%s" % (clue.number, guess))
+        # Valid guess
+        clues[number].set_guess(guess, guesser.name)
+        if TESTING: print("Guess for clue #%s:\n%s" % (number, guess))
 
 # Someone is confirming a guess
 def confirm_guess(number, text, user):
-    global clues, dead_clues
-    # Trying to confirm a guess that doesn't exist
+    global clues, dead_clues, last_clue_solved, pass_with_no_contact
     if number not in clues:
+        # Trying to confirm a guess that doesn't exist
         send_message("There is no clue #%s.  What exactly are you confirming?" % (number))
-    # Someone trying to confirm a guess for a clue they didn't set
     elif user.id != clues[number].setter_id:
+        # Someone trying to confirm a guess for a clue they didn't set
         add_guess(number, text, user) #If this isn't the setter of the clue, they're probably guessing, not confirming.
-    # Someone trying to confirm a guess for their clue, when no guess has been made.
     elif clues[number].guess == "":
+        # Someone trying to confirm a guess for their clue, when no guess has been made.
         send_message("There was no guess made for #%s.  What exactly are you confirming?" % (number))
-    # Someone properly confirming a guess for their own clue
     else:
-        remove_clue(clues[number], Clue_state.Solved)
-        # Check if this correct guess was for a passed clue.  If so, the defender needs to give up a letter.
-        if game_state == Game_state.Passed:
+        # Someone properly confirming a guess for their own clue
+        this_clue = clues[number]
+        if game_state == Game_state.Passed and this_clue.state == Clue_state.Passed:
+            # If this correct guess was for a passed clue, the defender needs to give up a letter.
             num_contact_guesses = 0
             set_game_state(Game_state.WaitingForLetter)
-            if verbose: send_message("You guessed correctly.  %s must give up a letter!" % (defender_name))
-        
-        if TESTING: print("Clues: %s" % (clues))
-        if TESTING: print("Dead: %s" % (dead_clues))
+            last_clue_solved = this_clue
+            if not pass_with_no_contact:
+                if verbose: send_message("You guessed correctly.  %s must give up a letter!" % (defender_name))
+            pass_with_no_contact = False
+
+        remove_clue(clues[number], Clue_state.Solved, None, user)
 
 # Someone is indicating that a guess is incorrect.
 def deny_guess(number, text, user):
     global clues
     
-    # Trying to deny a guess that doesn't exist.
     if number not in clues:
-        send_message("There is no clue #%s.  What exactly are you denying?" % (number))
-    # Someone trying to deny a guess for a clue they didn't set
+        # Trying to deny a guess that doesn't exist.
+        send_message("There is no clue #%s.  What exactly are you saying *no* to?" % (number))
     elif user.id != clues[number].setter_id:
+        # Someone trying to deny a guess for a clue they didn't set
         add_guess(number, text, user) #If this isn't the setter of the clue, they're probably guessing, not denying.
-    # Someone trying to deny a guess for their clue, when no guess has been made.
     elif clues[number].guess == "":
-        send_message("There was no guess made for #%s.  What exactly are you denying?" % (number))
-    # Someone properly denying a guess for their own clue, when the defender has passed
-    elif game_state == Game_state.Passed and num_contact_guesses >= len(clues[number].contacts):  #This is the last contacter to guess
+        # Someone trying to deny a guess for their clue, when no guess has been made.
+        send_message("There was no guess made for #%s.  What exactly are you saying *no* to?" % (number))
+    elif clues[number].state == Clue_state.Passed and num_contact_guesses >= len(clues[number].contacts) and not pass_with_no_contact:  #This is the last contacter to guess
+        # Someone properly denying a guess for their own clue, when the defender has passed
         send_message("It looks like no one guessed right.  Clue #%s is now dead. Carry on." % (number))
         print("Last contact's guess was wrong.  Clue is dead.  Resuming regular game.")
         clues[number].set_guess("", "")
-        remove_clue(clues[number], Clue_state.Dead, Game_state.Guessing)
         
+        remove_clue(clues[number], Clue_state.Dead, Game_state.Guessing)
         if TESTING: print("Clues: %s" % (clues))
         if TESTING: print("Dead: %s" % (dead_clues))
-    # Someone properly denying a guess for their own clue in Guessing state, or for not-the-last guess when the defender has passed
     else:
+        # Someone properly denying a guess for their own clue in Guessing state,
+        # or for not-the-last guess when the defender has passed,
+        # or for any guess when the defender passed with no contacts
         clues[number].set_guess("", "")
 
 # Someone has contacted a clue
@@ -516,6 +610,11 @@ def add_contact(msg, numbers):
         # Valid contact.  Add to the list
         else:
             clues[number].contacts[msg.user.id] = msg.user.name
+            db = sqlite3.connect('Contact.db')
+            db.execute('INSERT INTO contact (ContacterId, ContacterName, ClueId) values (?, ?, ?)', (msg.user.id, msg.user.name, clues[number].db_id))
+            db.commit()
+            db.close()
+            
             if TESTING: print("Contacts for clue #%s:\n%s" % (number, clues[number].contacts.values()))
 
 # Someone has uncontacted a clue
@@ -526,25 +625,31 @@ def remove_contact(msg, numbers, remove_all = False):
         number = number.strip()
         # Trying to uncontact a non-existent clue
         if number not in clues:
-            if verbose: send_message("There doesn't appear to be an active clue with the number %s, therefore you can't uncontact it." % (number))
+            send_message("There doesn't appear to be an active clue with the number %s, therefore you can't uncontact it." % (number))
         # We are using a bot command to remove all contacts
         elif remove_all:
             clues[number].contacts = {}
-            if verbose: send_message("Cleared all contacts for clue #%s." % (number))
+            send_message("Cleared all contacts for clue #%s." % (number))
         # The contact exists.  Remove it.
         elif msg.user.id in clues[number].contacts.keys():
-                del clues[number].contacts[msg.user.id]
-                if TESTING: print("Contacts for clue #%s:\n%s" % (number, clues[number].contacts.values()))
+            del clues[number].contacts[msg.user.id]
+            db = sqlite3.connect('Contact.db')
+            db.execute('DELETE FROM contact WHERE Id IN (SELECT Id FROM contact WHERE ContacterId = ? AND ClueId = ?)', (msg.user.id, clues[number].db_id))
+            db.commit()
+            db.close()
+            
+            if TESTING: print("Contacts for clue #%s:\n%s" % (number, clues[number].contacts.values()))
         # The contact does not exist
         else:
-            if verbose: send_message("You can't uncontact a clue you never contacted! (#%s)" % (number))
+            send_message("You can't uncontact a clue you never contacted! (#%s)" % (number))
 
 # Someone has declared a clue dead after a new letter has been revealed
 def kill_clue(number, text, user, override = False):
     global clues
     # Trying to kill a non-existent clue
     if number not in clues:
-        send_message("There is no clue #%s." % (number))
+        return
+        # send_message("There is no clue #%s." % (number))
     # The owner of the clue is legit killing it (can be in any game state), or someone issued the !kill command
     elif clues[number].setter_id == user.id or override:
         remove_clue(clues[number], Clue_state.Dead)
@@ -566,7 +671,7 @@ def confirm_life(number, text, user):
 
 # The defender has passed on a clue
 def pass_clue(msg, number):
-    global clues
+    global clues, pass_with_no_contact
     # Make sure it's the defender passing.
     if msg.user.id != defender_id:
         send_message("Only the defender can pass on clues.")
@@ -579,14 +684,17 @@ def pass_clue(msg, number):
         set_game_state(Game_state.Passed)
         # Trying to pass when a clue hasn't been contacted (we do it anyway, but mention it just in case)
         if len(clues[number].contacts) == 0:
-            if verbose: send_message("...but clue #%s hasn't been contacted!?  Ok, I guess you know what you're doing... (You can `!unpass` if you made a mistake.)" % (number))
+            if verbose: send_message("...but clue #%s hasn't been contacted!?  Ok, I guess you know what you're doing... (You can **`!unpass`** if you made a mistake.)" % (number))
+            pass_with_no_contact = True
         else:
             pass_msg = "Clue #%s (**%s**) was contacted by: ***%s***. Make your guess" \
-                    % (number, clues[number].clue_text, ", ".join(user for user in clues[number].contacts.values()))
+                    % (number, html_to_markdown(clues[number].clue_text), ", ".join(user for user in clues[number].contacts.values()))
             if len(clues[number].contacts) > 1:
                 pass_msg += "es (one each)"
-            pass_msg += "!"
-            if verbose: send_message(pass_msg)
+            pass_msg += "! "
+            send_message(pass_msg)
+            if len(clues[number].contacts) > 1:
+                send_message("(Multiple guesses will be ignored until the first is confirmed.)")
         
 # Reverse a pass that was made in error
 def reverse_pass():
@@ -605,61 +713,218 @@ def reverse_pass():
         
 # The defender has posted a (new) letter.
 def repin_defender(msg, text):
-    global defending_message, defending_text, defending_timestamp, defender_name, defender_id, waves
-    # Try to unpin the existing "defending" message
-    try:
-        defending_message.cancel_stars()
-        time.sleep(1.1)
-    # If it can't be unpinned, there probably isn't one, and this is the start of a new game.
-    except:
-        reset()
-        waves = {}
-        if TESTING: print("No defender pinned")
-        
-    toggle_pinning(msg.message) # Pin the new "defending" message
+    global defending_message, defending_text, defending_timestamp, defender_name, defender_id, waves, defence_id, game_id
+
+    defending_text = text.upper().strip().replace(" ", "")
     
+    if msg.user.id != my_user.id: #If the bot is posting a "defending" message, it's resuming a saved game, so skip all this.
+        # Try to unpin the existing "defending" message
+        try:
+            defending_message.cancel_stars()
+        # If it can't be unpinned, there probably isn't one, and this is the start of a new game.
+        except:
+            reset()
+            waves = {}
+
+            db = sqlite3.connect('Contact.db')
+            cursor = db.cursor()
+            cursor.execute('INSERT INTO game (DefenderId, DefenderName, StartTimeUTC) values (?, ?, ?)', (msg.user.id, msg.user.name, datetime.utcnow()))
+            game_id = cursor.lastrowid
+            db.commit()
+            db.close()
+
+            send_message("New game ID is **%s** (you can use this to **`!resume`** an unfinished game if something goes wrong)." % (game_id))
+            
+            if TESTING: print("No existing defense message.  Assuming new game starting.")
+
+        defender_id = msg.user.id
+        defender_name = msg.user.name
+        defending_timestamp = msg.time_stamp
+
+        db = sqlite3.connect('Contact.db')
+        cursor = db.cursor()
+        cursor.execute('INSERT INTO defence (Text, GameId, ChatId, StartTimeUTC) values (?, ?, ?, ?)', (defending_text, game_id, msg.message.id, datetime.utcnow()))
+        defence_id = cursor.lastrowid
+        db.commit()
+        db.close()
+        
+        # Set all extant clues to "uncertain" status
+        for clue in clues.itervalues():
+            clue.set_state(Clue_state.Schroedinger)
+
     # Set the globals that have the defence data
     defending_message = msg.message
-    defending_text = text.upper().strip().replace(" ", "")
-    defender_id = msg.user.id
-    defender_name = msg.user.name
-    defending_timestamp = msg.time_stamp
-    
     set_game_state(Game_state.Guessing)
     
-    # Set all extant clues to "uncertain" status
-    for clue in clues.itervalues():
-        clue.set_state(Clue_state.Schroedinger)
-
+    time.sleep(1.1)
+    toggle_pinning(msg.message) # Pin the new "defending" message
+    
+            
+            
 # Helper function to invalidate a clue
-def remove_clue(clue, new_clue_state, new_game_state = None):
+def remove_clue(clue, new_clue_state, new_game_state = None, user = None):
     clue.set_state(new_clue_state)
     dead_clues.append(clue)
     message = clue.message # Temporary copy of message, to be used for unstarring below
-    del clues[clue.number] # Remove the clue from the list of active clues
+
+    # Add this clue to the database
+    db = sqlite3.connect('Contact.db')
+    if new_clue_state == Clue_state.Solved and user != None:
+        db.execute('UPDATE clue SET SolverId = ?, SolverName = ?, Solution = ?, DeathTimeUTC = ? WHERE Id = ?',
+                    (user.id, user.name, clue.guess, datetime.utcnow(), clue.db_id))
+    else:
+        db.execute('UPDATE clue SET DeathTimeUTC = ? WHERE Id = ?',
+                    (datetime.utcnow(), clue.db_id))
+    db.commit()
+    db.close()
+    
+    # If the game is over, we don't bother deleting individual clues; we'll just ditch the whole dictionary.
+    if new_game_state != Game_state.Finished:
+        del clues[clue.number] # Remove the clue from the list of active clues
     
     # Only cancel the star if there are no other clues in the same message (e.g. "4,5: Fifth space on a Monopoly board" for READING RAILROAD)
-    if not any([clue.message == message for clue in clues.itervalues()]):
+    if not message.deleted and (not any([clue.message == message for clue in clues.itervalues()]) or new_game_state == Game_state.Finished):
         message.cancel_stars()
     if new_game_state is not None:
         set_game_state(new_game_state)
 
+# The defender's word has been guessed.  End the game.
+def end_game(word = None):
+    last_clue = last_clue_solved if last_clue_solved is not None else last_clue_guessed
+    if last_clue is not None:
+        last_clue.set_state(Clue_state.Solved)
+        if word is not None:
+            send_message("Game over! %s wins with the clue **%s**, guessed by %s.  The solution (and presumably %s's word) was **%s**." % (last_clue.setter_name, html_to_markdown(last_clue.clue_text), last_clue.guesser_name, defender_name, word))
+
+    set_game_state(Game_state.Finished)
+
+    # Update game data in database
+    db = sqlite3.connect('Contact.db')
+    db.execute('UPDATE game SET EndTimeUTC = ?, WordDefended = ? WHERE Id = ?', (datetime.utcnow(), word, game_id))
+    db.commit()
+    db.close()
+    
+    # Since we're going to remove all pinned clues, display the remaining clues so people can discuss the answers if so desired.
+    if len(clues) > 0:
+        send_message("Remaining clues (for reference):")
+        display_clues(False)
+
+    old_game_id = game_id
+    
+    # "Kill" all remaining clues, and unstar them.  Also update them in the database
+    reset()
+    game_stats(old_game_id)
+
+def game_stats(id):
+    send_message("Stats for game #%s:\n" % (id))
+    message = ""
+    try:
+        db = sqlite3.connect('Contact.db')
+        row = db.execute("SELECT DefenderName, EndTimeUTC, StartTimeUTC from game WHERE Id = ?", (id,)).fetchall()[0]
+        message += "      Defender:          %s\n" % (row[0])
+
+        end_time = datetime.utcnow() if row[1] is None else datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S.%f")
+        total_seconds = (end_time - datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S.%f")).total_seconds()
+        hours = total_seconds // 3600
+        minutes = total_seconds % 3600 // 60
+        seconds = total_seconds % 60
+        message += "      Duration:          %s%s%s\n" % ( (("%dh " % (hours)) if hours > 0 else ""), (("%dm " % (minutes)) if hours + minutes > 0 else ""), (("%ds" % (seconds)) if seconds > 0 else "") )
+        
+        row = db.execute("""SELECT COUNT(DISTINCT Id) AS Players from
+            (SELECT DISTINCT SetterId AS Id FROM clue WHERE GameId = ?
+                UNION ALL SELECT DISTINCT SolverId FROM clue WHERE GameId = ?
+                UNION ALL SELECT DISTINCT ContacterId FROM contact INNER JOIN clue ON contact.ClueId = Clue.Id WHERE GameId = ?
+                UNION ALL SELECT DISTINCT DefenderId FROM game WHERE Id = ?
+            ) 
+            WHERE Id IS NOT NULL""", (id, id, id, id)).fetchall()[0]
+        message += "      Players:           %d\n" % (row[0])
+
+        rows = db.execute("SELECT Solution FROM clue WHERE GameId = ?", (id,)).fetchall()
+        message += "      Clues:             %d\n" % (len(rows))
+        message += "      %% clues solved:    %.1f\n" % (len(list(filter(lambda row: row[0] is not None, rows))) * 100 / float(len(rows)))
+
+        rows = db.execute("SELECT COUNT(DefenceId) FROM clue LEFT JOIN defence ON clue.DefenceId = defence.Id WHERE defence.GameId = ? GROUP BY DefenceId", (id,)).fetchall()
+        message += "      Avg. clues/letter: %.1f\n" % (sum(row[0] for row in rows) / float(len(rows)))
+    except:
+        print(sys.exc_info())
+        message = "Unable to retrieve game statistics.  An error occurred: %s" % (sys.exc_info())
+        
+    send_message(message)
+
+# Load an unfinished game from the database, so it can be resumed.
+def load_game(number):
+    global defender_id, defender_name, defending_text, clues, defending_message, game_id
+    
+    number = number.strip()
+    if game_state != Game_state.Finished and game_state != Game_state.None:
+        send_message("You can't resume a game when you're in the middle of another.  If the current game is over, you can use **`!gameover`** to let me know.")
+        return
+    elif number is None or number == "":
+        send_message("Command syntax: **`!resume `*`<gameNumber>`***.  You were given a game number when the game began (when the defender posted the first letter).")
+        return
+
+    db = sqlite3.connect('Contact.db')
+    results = db.execute('SELECT DefenderId, DefenderName, EndTimeUTC from game WHERE Id = ?', (number,))
+    rows = results.fetchall()
+    if not rows:
+        send_message("I couldn't find a game with ID **%s**.  Sorry, but it can't be resumed." % (number))
+    elif rows[0][2] is not None: #The game has an EndTime; it's already finished
+        send_message("Game #%s has already been completed.  It cannot be resumed." % (number))
+    else:
+        set_game_state(Game_state.Guessing)
+        defender_id = rows[0][0]
+        defender_name = rows[0][1]
+        
+        results = db.execute('SELECT Text, ChatId FROM defence WHERE GameId = ? ORDER BY StartTimeUTC DESC LIMIT 1', (number,))
+        rows = results.fetchall()
+        if rows:
+            defending_text = rows[0][0]
+            send_message("%s defending: **%s**" % (defender_name, defending_text))
+            
+        results = db.execute('SELECT ClueNumber, SetterId, SetterName, Text, Id FROM clue WHERE GameId = ? AND DeathTimeUTC IS NULL', (number,))
+        rows = results.fetchall()
+        if rows:
+            for row in rows:
+                c = clue()
+                c.number = row[0]
+                c.setter_id  = row[1]
+                c.setter_name = row[2]
+                c.clue_text = row[3]
+                c.db_id = row[4]
+                #c.message = client.get_message(row[3])
+                #c.message.star()
+                c.set_state(Clue_state.Set)
+                clues[row[0]] = c
+                send_message("%s: **%s** (*by %s*)" % (row[0], html_to_markdown(c.clue_text), c.setter_name))
+                
+        query = 'SELECT ContacterId, ContacterName, ClueId FROM contact WHERE ClueId IN (%s)' % (", ".join(['?'] * len(clues.keys())))
+        results = db.execute(query, (clues.keys()))
+        rows = results.fetchall()
+        if rows:
+            for row in rows:
+                for cl in clues.itervalues():
+                    if cl.db_id == row[2]:
+                        cl.contacts[row[0]] = row[1]
+        
+        game_id = number
+        send_message("Game #%s restored.  Note that any pending passes or guesses were not restored.  Play on!" % (number))
+
 # List active clues, along with their status
 def display_clues(only_unstarred):
-    clue_list = ""
-    for c in clues.itervalues():
+    clue_list = []
+    for c in sorted(clues.itervalues(), key=lambda cl: cl.timestamp, reverse=True):
         # Loop through all clues, or only those without a star, depending on the value of only_unstarred
         if c.message.stars == 0 or not only_unstarred:
-            this_clue = "%s: %s (by %s)" % (c.number, c.clue_text, c.setter_name)
+            this_clue = "%s : %s (by %s)" % (c.number, html_to_markdown(c.clue_text), c.setter_name)
             if c.guess != "":
                 this_clue += " (waiting for confirmation of guess %s by %s)" % (c.guess, c.guesser_name)
             if len(c.contacts) > 0: # Clue has been contacted
                 this_clue += " (contacted by %s)" % (", ".join(user for user in c.contacts.values()))
             if c.state == Clue_state.Schroedinger: # Clue owner hasn't confirmed alive/dead.
                 this_clue += " (status uncertain)"
-            clue_list += this_clue + "\n"
-    if clue_list != "":
-        send_message(clue_list, False) # No length check; message could easily be over 500 chars, and that's ok.
+            clue_list.append(this_clue)
+    if len(clue_list) > 0:
+        send_message("\n".join(clue_list), False) # No length check; message could easily be over 500 chars, and that's ok.
     elif only_unstarred:
         send_message("There are no active unstarred clues.  (Good work!)")
     else:
@@ -706,10 +971,9 @@ def display_contacts(command):
 
 # Reset the game state.  Unstar any messages from the previous game.
 def reset():
-    global defending_message, defending_timestamp, defender, defender_id, clues, dead_clues
-    for c in clues.keys():
-        clues[c].message.cancel_stars()
-        time.sleep(1.1)
+    global defending_message, defending_timestamp, defender, defender_id, clues, dead_clues, game_id, num_contact_guesses, pass_with_no_contact
+    for c in clues.itervalues():
+        remove_clue(c, Clue_state.Dead, Game_state.Finished)
     if defending_message is not None:
         defending_message.cancel_stars()
     clues = {}
@@ -718,6 +982,9 @@ def reset():
     defending_timestamp = None
     defender = ""
     defender_id = -1
+    pass_with_no_contact = False
+    num_contact_guesses = 0
+    game_id = -1
 
 # Move to a different game state, as defined by the Game_state enum
 def set_game_state(state):
@@ -728,6 +995,23 @@ def set_game_state(state):
 # Post a message to the room, provided the bot has not been told to !shutup
 # By default, the message can't be more than 500 characters, or it will fail silently.  Setting length_check to False allows longer messages.
 def send_message(message, length_check=True):
+    global recent_messages
+    
+    # Prune any old entries from the list of recent messages.
+    messages_to_keep = {}
+    for old_message, time in recent_messages.iteritems():
+        if (datetime.utcnow() - time).total_seconds() <= MESSAGE_DUPE_DELAY:
+            messages_to_keep[old_message] = time
+    recent_messages = messages_to_keep
+            
+    # Don't continue if we've recently posted the same message
+    if message in recent_messages.iterkeys():
+        return;
+        
+    # Add this message to the list of recently-posted messages
+    recent_messages[message] = datetime.utcnow()
+    
+    # Post the message, if we're not muted.
     if muted_timestamp is None or (datetime.utcnow() - muted_timestamp).total_seconds() > mute_length:
         room.send_message(message, length_check)
 
@@ -815,20 +1099,23 @@ def check_waves():
 
 # Print a help message
 def info():
-    send_message("""    Hello! I'm %s, a bot to help with the game of Contact. 
-    I will try to keep track of the game state and keep the game moving. If you're on my whitelist, you can use the following commands to communicate with me (some are mod-only): 
-     !clues                    - list all active clues
-     !contacts [clueNum]       - list contacts for a specific clue or all clues
-     !unpass                   - undo a "pass" if you made a mistake
-     !kill                     - remove a clue from the list of active clues. This will kill anyone's clue, not just your own.
-     !uncontact clueNum        - remove all contacts for clue "clueNum"
-     !shutup [minutes]         - silence me completely for the specified amount of time (defaults to 10 min)
-     !speak                    - undo a !shutup command
-     !verbose [on|off]         - in verbose mode, I'll comment more on game events. No parameter lists the current state
-     !whitelist [[+|-]userNum] - add/remove a user from the whitelist, or list users on the whitelist
-     !pinglist [[+|-]userName] - add/remove a user from the pinglist, or list users on the pinglist
-     !ping                     - ping all users on the pinglist to indicate that you want to start a game
-     !shutdown                 - shut me down permanently. I will need to be restarted by the bot owner""" % (my_user.name), False)
+    send_message("Hello! I'm %s, a bot to help with the game of Contact.\nI will try to keep track of the game state and keep the game moving. If you're on my whitelist, you can use the following commands to communicate with me (some are mod-only):" % (my_user.name))
+    send_message("""     !clues                      - list all active clues
+     !contacts [<clueNum>]       - list contacts for a specific clue or all clues
+     !unpass                     - undo a "pass" if you made a mistake
+     !kill                       - remove a clue from the list of active clues. This will kill anyone's clue, not just your own.
+     !gameover                   - ends a game, resetting my data
+     !uncontact <clueNum>        - remove all contacts for clue <clueNum>
+     !shutup [<minutes>]         - silence me completely for the specified amount of time (defaults to 10 min)
+     !speak                      - undo a !shutup command
+     !verbose [on|off]           - in verbose mode, I'll comment more on game events. No parameter lists the current state
+     !resume <gameNum>           - if I died or a game was otherwise interrupted, restore the game state
+     !stats <gameNum>            - displays some some statistical information for the specified game
+     !gameover                   - immediately ends the current game, removing clues and displaying statistics for the game
+     !whitelist [[+|-]<userNum>] - add/remove a user from the whitelist, or list users on the whitelist
+     !pinglist [[+|-]<userName>] - add/remove a user from the pinglist, or list users on the pinglist
+     !ping                       - ping all users on the pinglist to indicate that you want to start a game
+     !shutdown                   - shut me down permanently. I will need to be restarted by the bot owner""", False)
 
 def modify_list(list_var, param, table_name):
     if param != "":
@@ -841,7 +1128,6 @@ def modify_list(list_var, param, table_name):
     else:
         show_list(list_var)
 
-  
 def add_list(list_var, param, table_name):
     list_var.add(param)
     try:
@@ -853,7 +1139,7 @@ def add_list(list_var, param, table_name):
     db.execute('INSERT INTO {} (user) values (?)'.format(table_name), (param,))
     db.commit()
     db.close()
-
+    
 def remove_list(list_var, param, table_name):
     if param not in list_var:
         send_message("%s is not on the %s." % (param, table_name))
@@ -879,6 +1165,16 @@ def cooldown(seconds):
         ret_fn.last_time_stamp = 0
         return ret_fn
     return inner
+    
+def html_to_markdown(text):
+    return text.replace("<b>", "**") \
+               .replace("</b>", "**") \
+               .replace("<i>", "*") \
+               .replace("</i>", "*") \
+               .replace("<code>", "`") \
+               .replace("</code>", "`") \
+               .replace("<strike>", "---") \
+               .replace("</strike>", "---")
 
 @cooldown(1)
 def toggle_pinning(msg):
@@ -892,8 +1188,9 @@ def add_star(msg):
 
 @cooldown(10)
 def ping():
-    for x in range(0, len(pinglist), 10):
-        send_message( " ".join('@'+name for name in pinglist[x:x+10]) )
+    to_ping = list(pinglist)
+    for x in range(0, len(to_ping), 10):
+        send_message( " ".join('@'+name.replace(" ", "") for name in to_ping[x:x+10]) )
 
 @cooldown(10)
 def show_list(list_var):
@@ -905,13 +1202,40 @@ def show_list(list_var):
     send_message(list, False) #Allow more than 500 chars
     if len(list) > 500:
         send_message("That list is getting kind of long.  You might want to consider pruning those who are no longer active...")
+
+def get_next_id(table_name):
+    db = sqlite3.connect('Contact.db')
+    results = db.execute("SELECT MAX(Id) FROM %s" % (table_name))
+    max = results.fetchall()[0][0]
+    if not max:
+        return 1
+    else:
+        return max + 1
+    db.close()
+
+def init_db():
+    db = sqlite3.connect('Contact.db')
+    
+    init_table(db, "clue", "Id INTEGER PRIMARY KEY AUTOINCREMENT, ClueNumber TEXT, SetterId INT, SetterName TEXT, SolverId INT, SolverName TEXT, Solution TEXT, Text TEXT, GameId INT, DefenceId INT, ChatId INT, PostTimeUTC DATETIME, DeathTimeUTC DATETIME")
+    init_table(db, "contact", "Id INTEGER PRIMARY KEY AUTOINCREMENT, ContacterId INT, ContacterName TEXT, ClueId INT, ChatId INT, ContactTimeUTC DATETIME")
+    init_table(db, "defence", "Id INTEGER PRIMARY KEY AUTOINCREMENT, Text TEXT, GameId INT, ChatId INT, StartTimeUTC DATETIME")
+    init_table(db, "game", "Id INTEGER PRIMARY KEY AUTOINCREMENT, DefenderId INT, DefenderName TEXT, WordDefended TEXT, StartTimeUTC DATETIME, EndTimeUTC DATETIME")
+        
+    db.close()
+    
+def init_table(db, table_name, fields):
+    results = db.execute("SELECT * FROM sqlite_master WHERE type='table' AND name='%s'" % (table_name))
+    rows = results.fetchall()
+    if not rows:
+        db.execute('CREATE TABLE %s (%s)' % (table_name, fields))
+        db.commit()
         
 def init_list(list_var, table_name):
     db = sqlite3.connect('temp.db')
     
     results = db.execute("SELECT * FROM sqlite_master WHERE type='table' AND name='%s'" % (table_name));
     if not results.fetchall():
-        db.execute('CREATE TABLE %s (user int)' % (table_name))
+        db.execute('CREATE TABLE %s (user text)' % (table_name))
         db.commit()
         db.close()
 
