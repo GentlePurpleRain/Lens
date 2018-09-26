@@ -60,6 +60,7 @@ class clue:
 Clue_state = enum("None", "Set", "Passed", "Schroedinger", "Solved", "Dead") # Schroedinger means a pass happened, and the clue hasn't been declared alive or dead.
 Game_state = enum("None", "Guessing", "Passed", "WaitingForLetter", "Finished")
 
+#Configurable values
 TESTING = False  # Enables verbose debug output to console, and disables user checking for various clue/guess/contact events.  Also changes the chat room used. Should be turned off for production.
 SCHROEDINGER_TIMEOUT = 90 # The time before the bot reminds a user to indicate whether their clue is alive or dead (in seconds)
 GUESS_TIMEOUT = 30 # The time before the bot reminds a clue setter to confirm/deny a guess that has been made.
@@ -68,7 +69,7 @@ WAVES_FOR_PING = 3 # The number of waves o/ required to trigger an auto-ping
 MAX_CLUES = 10 # If this many clues are active, the bot will suggest not posting more clues, and may suggest a pass or more contacts, based on the number of current contacts.
 DEFAULT_MUTE_LENGTH = 600 # The number of seconds the bot will stay silent when muted, if a time isn't explicitly provided.
 CONTACT_THRESHOLD = 5 # The minimum number of contacts required before the bot suggests that the defender pass (only if clues are above MAX_CLUES)
-MESSAGE_DUPE_DELAY = 10 # The time period within which we cannot post two identical messages.
+MESSAGE_DUPE_DELAY = 10 # The time period within which the bot cannot post two identical messages.
 
 client = None # The ChatExchange client reference
 room = None # The ChatExchange room reference
@@ -415,7 +416,8 @@ def add_clue(msg, number, text, is_edit):
         return
 
     elif game_state == Game_state.Passed:
-        send_message("%s has passed on clue #%s. Please don't post any new clues until the pass has been resolved. I recommend deleting this clue, and reposting after the pass is resolved. (I am ignoring it.)" % (defender_name, number))
+        passed_clue_number = [c.number for c in clues.values() if c.state == Clue_state.Passed][0] # There should only ever be one clue in the Passed state.
+        send_message("%s has passed on clue #%s. Please don't post any new clues until the pass has been resolved. I recommend deleting this clue, and reposting after the pass is resolved. (I am ignoring it.)" % (defender_name, passed_clue_number))
     elif game_state == Game_state.WaitingForLetter:
         send_message("We are waiting on %s to provide a new letter. Please don't post any new clues until they have done so. I recommend deleting this clue (I am ignoring it)" % (defender_name))
     elif game_state == Game_state.Finished:
